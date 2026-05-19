@@ -10,6 +10,7 @@ import ragRouter from "./routes/rag.js";
 import contactsRouter from "./routes/contacts.js";
 import agentRouter from "./routes/agent.js";
 import intelligenceRouter from "./routes/intelligence.js";
+import reclassifyRouter from "./routes/reclassify.js";
 import { query } from "./db.js";
 
 const app: Express = express();
@@ -39,6 +40,7 @@ app.use('/api/rag', ragRouter);
 app.use('/api/contacts', contactsRouter);
 app.use('/api/agent', agentRouter);
 app.use('/api/intelligence', intelligenceRouter);
+app.use('/api', reclassifyRouter);
 
 app.get('/api/healthz', (req, res) => {
   res.json({ status: 'ok' });

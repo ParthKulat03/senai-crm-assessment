@@ -8,14 +8,14 @@ An AI-powered B2B customer support CRM that automatically triages incoming email
 - `pnpm --filter @workspace/senai-crm run dev` — run the frontend (port 25722)
 - `pnpm run typecheck` — full typecheck across all packages
 - Required env: `DATABASE_URL` — Postgres connection string (Replit PostgreSQL)
-- Required env: `GROQ_API_KEY` — Groq API key for llama3-70b-8192
+- Required env: `GROQ_API_KEY` — Groq API key for llama-3.3-70b-versatile
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
 - API: Express 5 + WebSocket (ws)
 - DB: PostgreSQL (raw pg Pool + manual migrations in db.ts)
-- AI: Groq API (llama3-70b-8192) via axios
+- AI: Groq API (llama-3.3-70b-versatile) via axios
 - Frontend: React + Vite + Wouter + Recharts
 - Build: esbuild (ESM bundle)
 

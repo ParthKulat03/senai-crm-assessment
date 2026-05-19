@@ -3,9 +3,8 @@ import path from 'path';
 import fs from 'fs';
 import { query } from '../db.js';
 import { runHeuristicFilter } from '../services/heuristicFilter.js';
-import { classifyEmail } from '../services/llmClassifier.js';
-import { retrieveRelevantChunks } from '../services/ragPipeline.js';
-import { runAgent } from '../services/agentRunner.js';
+import { classifyAndSave } from '../services/classifyAndSave.js';
+import { logger } from '../lib/logger.js';
 
 const router = Router();
 
@@ -45,21 +44,12 @@ router.post('/ingest', async (req, res) => {
     const emailId = insertResult.rows[0].id;
     setImmediate(async () => {
       try {
-        const threadHistory = (await query('SELECT * FROM emails WHERE thread_id=$1 ORDER BY timestamp ASC', [thread_id])).rows;
-        const ragChunks = await retrieveRelevantChunks(`${subject} ${truncatedBody}`, 3);
-        const cls = await classifyEmail({ message_id, sender, subject, body: truncatedBody }, threadHistory, ragChunks as { source_doc: string; chunk_text: string }[]);
-        await query(
-          'UPDATE emails SET category=$1, sentiment_label=$2, sentiment_score=$3, urgency=$4, requires_human=$5, confidence=$6, suggested_reply=$7, escalation_reason=$8, policy_citations=$9, detected_entities=$10 WHERE id=$11',
-          [cls.category, cls.sentiment, cls.sentiment_score, cls.urgency, cls.requires_human, cls.confidence, cls.suggested_reply, cls.escalation_reason, JSON.stringify(cls.policy_citations), JSON.stringify(cls.detected_entities), emailId]
-        );
-        const fullEmail = (await query('SELECT * FROM emails WHERE id=$1', [emailId])).rows[0];
-        if (fullEmail) await runAgent(fullEmail, cls, false);
-        const app = req.app;
-        if (app.locals.broadcast) {
-          app.locals.broadcast({ type: 'email_processed', emailId });
+        await classifyAndSave({ id: emailId, message_id, sender, subject, body: truncatedBody, thread_id });
+        if (req.app.locals.broadcast) {
+          req.app.locals.broadcast({ type: 'email_processed', emailId });
         }
       } catch (e: unknown) {
-        console.error('Classification error:', (e as Error).message);
+        logger.error({ err: e }, `ingest: async classification failed for ${message_id}`);
       }
     });
   }
@@ -79,36 +69,56 @@ router.post('/simulate', async (req, res) => {
     res.status(404).json({ error: 'email-data-advanced.json not found in project root' });
     return;
   }
-  const testData = JSON.parse(fs.readFileSync(testDataPath, 'utf8')) as unknown[];
+  const testData = JSON.parse(fs.readFileSync(testDataPath, 'utf8')) as Record<string, string>[];
   res.json({ status: 'started', total: testData.length });
+  logger.info(`simulate: ingesting ${testData.length} emails sequentially`);
 
-  for (let i = 0; i < testData.length; i++) {
-    await new Promise(r => setTimeout(r, 800));
-    const email = testData[i] as Record<string, string>;
-    try {
-      const hResult = runHeuristicFilter(email);
-      await query('INSERT INTO contacts(email) VALUES($1) ON CONFLICT(email) DO UPDATE SET last_contact_at=NOW()', [email.sender]);
-      await query('INSERT INTO threads(thread_id, subject, sender_email) VALUES($1,$2,$3) ON CONFLICT(thread_id) DO UPDATE SET last_updated_at=NOW(), email_count=threads.email_count+1', [email.thread_id, email.subject, email.sender]);
-      const insertResult = await query(
-        'INSERT INTO emails(message_id, thread_id, sender, subject, body, timestamp, is_spam, is_internal, heuristic_flags, urgency, status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(message_id) DO NOTHING RETURNING id',
-        [email.message_id, email.thread_id, email.sender, email.subject, email.body, email.timestamp, hResult.isSpam, hResult.isInternal, JSON.stringify(hResult.flags), hResult.initialPriority, 'Received']
-      );
-      if (!hResult.isSpam && !hResult.isInternal && insertResult.rows.length > 0) {
-        const emailId = insertResult.rows[0].id;
-        setTimeout(async () => {
-          try {
-            const threadHistory = (await query('SELECT * FROM emails WHERE thread_id=$1 ORDER BY timestamp ASC', [email.thread_id])).rows;
-            const ragChunks = await retrieveRelevantChunks(`${email.subject} ${email.body}`, 3);
-            const cls = await classifyEmail(email as { message_id: string; sender: string; subject?: string; body?: string }, threadHistory, ragChunks as { source_doc: string; chunk_text: string }[]);
-            await query('UPDATE emails SET category=$1, sentiment_label=$2, sentiment_score=$3, urgency=$4, requires_human=$5, confidence=$6, suggested_reply=$7, escalation_reason=$8, policy_citations=$9, detected_entities=$10 WHERE id=$11',
-              [cls.category, cls.sentiment, cls.sentiment_score, cls.urgency, cls.requires_human, cls.confidence, cls.suggested_reply, cls.escalation_reason, JSON.stringify(cls.policy_citations), JSON.stringify(cls.detected_entities), emailId]);
-            const fullEmail = (await query('SELECT * FROM emails WHERE id=$1', [emailId])).rows[0];
-            if (fullEmail) await runAgent(fullEmail, cls, false);
-          } catch (e: unknown) { console.error('Sim classify error:', (e as Error).message); }
-        }, i * 1500);
+  // Run in the background — ingest all, then reclassify sequentially
+  (async () => {
+    let inserted = 0;
+    const toClassify: { id: string; message_id: string; sender: string; subject?: string; body?: string; thread_id?: string }[] = [];
+
+    // Phase 1: insert all emails (fast, no Groq calls)
+    for (const email of testData) {
+      try {
+        const hResult = runHeuristicFilter(email);
+        await query('INSERT INTO contacts(email) VALUES($1) ON CONFLICT(email) DO UPDATE SET last_contact_at=NOW()', [email.sender]);
+        await query('INSERT INTO threads(thread_id, subject, sender_email) VALUES($1,$2,$3) ON CONFLICT(thread_id) DO UPDATE SET last_updated_at=NOW(), email_count=threads.email_count+1', [email.thread_id, email.subject, email.sender]);
+        const insertResult = await query(
+          'INSERT INTO emails(message_id, thread_id, sender, subject, body, timestamp, is_spam, is_internal, heuristic_flags, urgency, status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(message_id) DO NOTHING RETURNING id',
+          [email.message_id, email.thread_id, email.sender, email.subject, email.body, email.timestamp, hResult.isSpam, hResult.isInternal, JSON.stringify(hResult.flags), hResult.initialPriority, 'Received']
+        );
+        if (!hResult.isSpam && !hResult.isInternal && insertResult.rows.length > 0) {
+          inserted++;
+          toClassify.push({ id: insertResult.rows[0].id, message_id: email.message_id, sender: email.sender, subject: email.subject, body: email.body, thread_id: email.thread_id });
+        }
+      } catch (e: unknown) {
+        logger.error({ err: e }, `simulate: insert failed for ${email.message_id}`);
       }
-    } catch (e: unknown) { console.error(`Sim error:`, (e as Error).message); }
-  }
+    }
+
+    logger.info(`simulate: inserted ${inserted} emails, starting sequential LLM classification of ${toClassify.length} emails (2s delay each)`);
+
+    // Phase 2: classify sequentially with 2s delay to stay within Groq rate limits
+    let success = 0;
+    let failed = 0;
+    for (let i = 0; i < toClassify.length; i++) {
+      const email = toClassify[i];
+      try {
+        await classifyAndSave(email);
+        success++;
+        logger.info(`simulate: [${i + 1}/${toClassify.length}] classified ${email.message_id}`);
+      } catch {
+        failed++;
+        logger.warn(`simulate: [${i + 1}/${toClassify.length}] classification failed for ${email.message_id}, skipping`);
+      }
+      if (i < toClassify.length - 1) {
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+
+    logger.info(`simulate: DONE — success=${success} failed=${failed} total=${toClassify.length}`);
+  })().catch(err => logger.error({ err }, 'simulate background loop crashed'));
 });
 
 export default router;

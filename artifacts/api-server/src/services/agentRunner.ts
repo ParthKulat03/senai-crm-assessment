@@ -33,7 +33,7 @@ async function groqRequest(messages: { role: string; content: string }[], maxTok
     try {
       const resp = await axios.post(
         'https://api.groq.com/openai/v1/chat/completions',
-        { model: 'llama3-70b-8192', max_tokens: maxTokens, temperature: 0.1, messages },
+        { model: 'llama-3.3-70b-versatile', max_tokens: maxTokens, temperature: 0.1, messages },
         { headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' } }
       );
       return resp.data;
