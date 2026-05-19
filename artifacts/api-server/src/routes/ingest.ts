@@ -74,7 +74,7 @@ router.post('/ingest', async (req, res) => {
 });
 
 router.post('/simulate', async (req, res) => {
-  const testDataPath = path.join(process.cwd(), 'email-data-advanced.json');
+  const testDataPath = path.join(process.cwd(), '..', '..', 'email-data-advanced.json');
   if (!fs.existsSync(testDataPath)) {
     res.status(404).json({ error: 'email-data-advanced.json not found in project root' });
     return;
